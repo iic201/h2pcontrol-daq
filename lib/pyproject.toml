@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h2pcontrol-daq"
+version = "1.0.0"
+description = "A Python package for controlling the H2P DAQ system."
+authors = [
+  { name = "Tijmen Hilgenkamp", email = "t.j.hilgenkamp@student.vu.nl" },
+  { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
+]
+requires-python = ">=3.11"
+dependencies = []
