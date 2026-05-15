@@ -1,36 +1,18 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
 
 [project]
 name = "h2pcontrol-daq"
-version = "1.0.0"
-description = "A Python package for controlling the H2P DAQ system."
-authors = [
-  { name = "Tijmen Hilgenkamp", email = "t.j.hilgenkamp@student.vu.nl" },
-  { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
+version = "0.1.0"
+maintainers = [
+    { name = "Ignacio Icaza", email = "i.icaza.navarro@student.vu.nl" },
 ]
+description = "LocalDAQ package for H2PControl servers"
 requires-python = ">=3.11"
 dependencies = [
-  "h5py>=3.10.0",
-  "numpy>=1.26.0",
+    "h5py",
 ]
 
-[project.optional-dependencies]
-influx = [
-  "influxdb-client>=1.49.0",
-]
-grpc = [
-  "betterproto2==0.4.0",
-  "grpcio>=1.72.1",
-  "grpclib>=0.4.8",
-]
-dev = [
-  "build>=1.2.2.post1",
-]
-
-[project.urls]
-Homepage = "https://github.com/iic201/h2pcontrol-daq.git"
-
-[tool.setuptools]
-py-modules = ["daq_pipeline"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/h2pcontrol_daq"]
