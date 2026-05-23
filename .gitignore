@@ -8,3 +8,7 @@ __pycache__/
 test/
 dist/
 .env
+.logs
+data/
+scripts/
+*.txt
