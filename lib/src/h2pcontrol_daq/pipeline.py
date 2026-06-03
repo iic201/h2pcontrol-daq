@@ -6,9 +6,24 @@ import json
 import h5py
 import logging
 import csv
+import os
+import socket
+import uuid
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, cast
 from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig, LocalDAQStats
 from .centralDAQ_connector.grpc_central_sink import GrpcDAQSink
+from .influx_sink import LocalInfluxSink
 from pathlib import Path
+from .buffer.preview import PreviewFrame
+
+_PROCESS_START_NS = time.time_ns()
+_RAW_RUN_ID = f"{socket.gethostname()}_{os.getpid()}_{_PROCESS_START_NS}"
+_RUN_ID = uuid.uuid5(uuid.NAMESPACE_DNS, _RAW_RUN_ID).hex
+
+
+def get_run_id() -> str:
+    return str(_RUN_ID)
 
 class LocalDAQ:
     def __init__(self, config: DAQConfig | None = None) -> None:
@@ -19,9 +34,10 @@ class LocalDAQ:
         self._ingress_q: asyncio.Queue[PendingEvent] = asyncio.Queue(
             maxsize=self.config.ingress_maxsize
         )
-        self._outbound_jsonl_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
-            maxsize=self.config.outbound_maxsize
-        )
+        # Uncomment if you want to output JSONL
+        # self._outbound_jsonl_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
+        #     maxsize=self.config.outbound_maxsize
+        # )
         self._outbound_hdf5_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
@@ -29,6 +45,9 @@ class LocalDAQ:
             maxsize=self.config.outbound_maxsize
         )
         self._outbound_central_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
+            maxsize=self.config.outbound_maxsize
+        )
+        self._outbound_influx_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
         self._tasks: list[asyncio.Task] = []
@@ -41,44 +60,82 @@ class LocalDAQ:
             queue=self._outbound_central_q,
             logger=self.logger
         )
+        self.local_influx_sink: LocalInfluxSink | None = None
 
     async def start(self) -> None:
         self.logger.info("Starting DAQ with config: %s", self.config)
+        if self.config.enable_local_influx:
+            self.local_influx_sink = LocalInfluxSink.from_daq_config(self.config)
+            self.logger.info("[I] Local InfluxDB writes enabled.")
+
         # Create one worker for the serializer and one each for the writers.
         self._tasks = [
-            asyncio.create_task(self._serializer_loop(), name="daq-serializer"),
-            asyncio.create_task(self._writer_jsonl_loop(), name="daq-writer-jsonl"),
-            asyncio.create_task(self._writer_hdf5_loop(), name="daq-writer-hdf5"),
-            asyncio.create_task(self._writer_csv_loop(), name="daq-writer-csv"),
+            asyncio.create_task(self._serializer_loop(),
+                                name="daq-serializer"),
+            # Uncomment if you want to output JSONL
+            # asyncio.create_task(self._writer_jsonl_loop(),
+            #                     name="daq-writer-jsonl"),
+            asyncio.create_task(self._writer_hdf5_loop(),
+                                name="daq-writer-hdf5"),
+            asyncio.create_task(self._writer_csv_loop(),
+                                name="daq-writer-csv"),
         ]
 
         if self.config.enable_central_stream:
-            self.logger.info("[C] Central stream enabled. Starting central sink task.")
+            self.logger.info(
+                "[C] Central stream enabled. Starting central sink task.")
             self._tasks.append(
-                asyncio.create_task(self.central_sink.run(), name="daq-central-sink")
+                asyncio.create_task(self.central_sink.run(),
+                                    name="daq-central-sink")
+            )
+
+        if self.config.enable_local_influx:
+            self._tasks.append(
+                asyncio.create_task(self._writer_influx_loop(),
+                                    name="daq-writer-influx")
             )
 
     async def stop(self) -> None:
-        self.logger.info("Stopping DAQ having published %s events. Having dropped %s ingress events and %s outbound events.\n", 
-                         self.stats.published, self.stats.dropped_ingress, self.stats.dropped_outbound_jsonl + self.stats.dropped_outbound_hdf5 + self.stats.dropped_outbound_csv)
+        dropped_outbound = (
+            # Uncomment if you want to output JSONL
+            # self.stats.dropped_outbound_jsonl
+            + self.stats.dropped_outbound_hdf5
+            + self.stats.dropped_outbound_csv
+            + self.stats.dropped_outbound_central
+            + self.stats.dropped_outbound_influx
+        )
+        self.logger.info("Stopping DAQ having published %s events. Having dropped %s ingress events and %s outbound events.\n",
+                         self.stats.published, self.stats.dropped_ingress, dropped_outbound)
         self._stopping = True
         # Wait for queues to be fully processed before cancelling tasks.
         await self._ingress_q.join()
-        await self._outbound_jsonl_q.join()
+        # Uncomment if you want to output JSONL
+        # await self._outbound_jsonl_q.join()
         await self._outbound_hdf5_q.join()
         await self._outbound_csv_q.join()
-        await self._outbound_central_q.join()
+        if self.config.enable_central_stream:
+            await self._join_or_drop_queue(
+                self._outbound_central_q,
+                timeout=self.config.central_flush_timeout_s,
+                dropped_counter="dropped_outbound_central",
+                queue_name="central stream",
+            )
+        await self._outbound_influx_q.join()
+        await self.central_sink.stop()
         # Cancel any remaining tasks
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self.local_influx_sink is not None:
+            self.local_influx_sink.close()
 
     def _create_data_path(self) -> bool:
         Path("data").mkdir(parents=True, exist_ok=True)
         if Path("data").exists():
             return True
         else:
-            self.logger.error("Failed to create data directory at path: %s", Path("data"))
+            self.logger.error(
+                "Failed to create data directory at path: %s", Path("data"))
             return False
 
     def publish_pending_event(self, event: PendingEvent) -> None:
@@ -103,6 +160,10 @@ class LocalDAQ:
             counter_name = "dropped_outbound_csv"
         elif queue_name == "outbound_central":
             counter_name = "dropped_outbound_central"
+        elif queue_name == "outbound_influx":
+            counter_name = "dropped_outbound_influx"
+        else:
+            raise ValueError(f"Unknown queue name: {queue_name}")
 
         if policy == OverflowPolicy.DROP_NEWEST:
             setattr(self.stats, counter_name, getattr(
@@ -128,6 +189,41 @@ class LocalDAQ:
             setattr(self.stats, counter_name, getattr(
                 self.stats, counter_name) + 1)
 
+    async def _join_or_drop_queue(
+        self,
+        q: asyncio.Queue,
+        *,
+        timeout: float,
+        dropped_counter: str,
+        queue_name: str,
+    ) -> None:
+        try:
+            await asyncio.wait_for(q.join(), timeout=max(0.0, timeout))
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        dropped = self._drop_queued_items(q, dropped_counter)
+        self.logger.warning(
+            "Timed out after %.2fs flushing %s; dropped %d queued events.",
+            timeout,
+            queue_name,
+            dropped,
+        )
+
+    def _drop_queued_items(self, q: asyncio.Queue, dropped_counter: str) -> int:
+        dropped = 0
+        while True:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            q.task_done()
+            dropped += 1
+
+        setattr(self.stats, dropped_counter, getattr(self.stats, dropped_counter) + dropped)
+        return dropped
+
     async def _serializer_loop(self) -> None:
         while True:
             pending = await self._get_or_stop_pending(self._ingress_q, timeout=0.2)
@@ -148,12 +244,12 @@ class LocalDAQ:
                     data=pending.data,
                 )
                 self.stats.serialized += 1
-                self._queue_put_now(
-                    self._outbound_jsonl_q,
-                    event,
-                    self.config.outbound_overflow,
-                    "outbound_jsonl",
-                )
+                # self._queue_put_now(
+                #     self._outbound_jsonl_q,
+                #     event,
+                #     self.config.outbound_overflow,
+                #     "outbound_jsonl",
+                # )
                 self._queue_put_now(
                     self._outbound_csv_q,
                     event,
@@ -168,12 +264,21 @@ class LocalDAQ:
                 )
 
                 if self.config.enable_central_stream:
-                    self.logger.info("[C] Central stream enabled. Queuing event.")
+                    self.logger.info(
+                        "[C] Central stream enabled. Queuing event.")
                     self._queue_put_now(
                         self._outbound_central_q,
                         event,
                         self.config.outbound_overflow,
                         "outbound_central",
+                    )
+
+                if self.config.enable_local_influx:
+                    self._queue_put_now(
+                        self._outbound_influx_q,
+                        event,
+                        self.config.outbound_overflow,
+                        "outbound_influx",
                     )
             except Exception:
                 self.stats.serialization_errors += 1
@@ -225,7 +330,8 @@ class LocalDAQ:
                 try:
                     await self._write_csv(batch)
                 except Exception:
-                    self.logger.exception("Failed to write batch of %d events", len(batch))
+                    self.logger.exception(
+                        "Failed to write batch of %d events", len(batch))
                 finally:
                     for _ in batch:
                         self._outbound_csv_q.task_done()
@@ -252,7 +358,8 @@ class LocalDAQ:
                 try:
                     await self._write_hdf5(batch)
                 except Exception:
-                    self.logger.exception("Failed to write batch of %d events", len(batch))
+                    self.logger.exception(
+                        "Failed to write batch of %d events", len(batch))
                 finally:
                     for _ in batch:
                         self._outbound_hdf5_q.task_done()
@@ -262,13 +369,30 @@ class LocalDAQ:
             if self._stopping and self._outbound_hdf5_q.empty() and not batch:
                 break
 
+    async def _writer_influx_loop(self) -> None:
+        while True:
+            event = await self._get_or_stop_daq_event(self._outbound_influx_q, timeout=0.5)
+            if event is not None:
+                try:
+                    if self.local_influx_sink is None:
+                        raise RuntimeError("Local InfluxDB sink was not initialized")
+                    await asyncio.to_thread(self.local_influx_sink.write_event, event)
+                except Exception:
+                    self.stats.dropped_outbound_influx += 1
+                    self.logger.exception("Failed to write event %s to InfluxDB", event.event_id)
+                finally:
+                    self._outbound_influx_q.task_done()
+
+            if self._stopping and self._outbound_influx_q.empty():
+                break
+
     async def _get_or_stop_pending(self, queue: asyncio.Queue, timeout: float) -> PendingEvent | None:
         # self.logger.info("Attempting to get item from queue (%s) with timeout: %f", queue, timeout)
         try:
             return await asyncio.wait_for(queue.get(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
-        
+
     async def _get_or_stop_daq_event(self, queue: asyncio.Queue, timeout: float) -> DAQEvent | None:
         # self.logger.info("Attempting to get item from queue (%s) with timeout: %f", queue, timeout)
         try:
@@ -285,8 +409,10 @@ class LocalDAQ:
             logger.removeHandler(handler)
 
         Path(".logs").mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(".logs/daq-info.log", encoding="utf-8")
-        error_file_handler = logging.FileHandler(".logs/daq-error.log", encoding="utf-8")
+        file_handler = logging.FileHandler(
+            ".logs/daq-info.log", encoding="utf-8")
+        error_file_handler = logging.FileHandler(
+            ".logs/daq-error.log", encoding="utf-8")
         error_file_handler.setLevel(logging.ERROR)
         file_handler.setLevel(logging.INFO)
 
@@ -299,18 +425,21 @@ class LocalDAQ:
         logger.addHandler(error_file_handler)
 
         return logger
-    
+
     async def _write_jsonl(self, events: list[DAQEvent]) -> None:
         if not self._data_path:
-            self.logger.error("[!] Data path not available. Cannot write JSONL.")
+            self.logger.error(
+                "[!] Data path not available. Cannot write JSONL.")
             return
-        
+
         Path("data/jsonl").mkdir(parents=True, exist_ok=True)
 
         for event in events:
-            path = Path("data/jsonl") / f"daq_capture_{event.producer_id}.jsonl"
+            path = Path("data/jsonl") / \
+                f"daq_capture_{_safe_filename_part(event.run_id)}.jsonl"
             record = {
                 "event_id": event.event_id,
+                "timestamp": event.timestamp,
                 "run_id": event.run_id,
                 "producer_id": event.producer_id,
                 "source": event.source,
@@ -327,81 +456,239 @@ class LocalDAQ:
         if not self._data_path:
             self.logger.error("[!] Data path not available. Cannot write CSV.")
             return
-        
+
         Path("data/csv").mkdir(parents=True, exist_ok=True)
 
+        events_by_run: dict[str, list[DAQEvent]] = {}
         for event in events:
-            path = Path("data/csv") / f"daq_capture_{event.producer_id}.csv"
-            file_exists = path.exists()
-            with path.open("a", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=[
-                    "event_id",
-                    "run_id",
-                    "producer_id",
-                    "source",
-                    "method",
-                    "direction",
-                    "message",
-                ])
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow({
+            events_by_run.setdefault(event.run_id, []).append(event)
+
+        base_fieldnames = [
+            "event_id",
+            "timestamp",
+            "run_id",
+            "producer_id",
+            "source",
+            "method",
+            "direction",
+        ]
+
+        for run_id, run_events in events_by_run.items():
+            path = Path("data/csv") / f"daq_capture_{_safe_filename_part(run_id)}.csv"
+            rows = [
+                {
                     "event_id": event.event_id,
+                    "timestamp": event.timestamp,
                     "run_id": event.run_id,
                     "producer_id": event.producer_id,
                     "source": event.source,
                     "method": event.method,
                     "direction": event.direction,
-                    "message": json.dumps(event.data, default=str),
-                })
-            
+                    **_flatten_for_csv(event.data, prefix="data"),
+                }
+                for event in run_events
+            ]
+            existing_rows: list[dict[str, Any]] = []
+            existing_fieldnames: list[str] = []
+            if path.exists():
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    existing_fieldnames = list(reader.fieldnames or [])
+                    existing_rows = list(reader)
+
+            dynamic_fieldnames = sorted(
+                {
+                    key
+                    for row in [*existing_rows, *rows]
+                    for key in row
+                    if key not in base_fieldnames
+                }
+            )
+            fieldnames = base_fieldnames + dynamic_fieldnames
+            mode = "w" if existing_fieldnames != fieldnames else "a"
+            with path.open(mode, encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if mode == "w":
+                    writer.writeheader()
+                    writer.writerows(existing_rows)
+                writer.writerows(rows)
 
         self.logger.info("Flushed %d events of type csv", len(events))
 
     async def _write_hdf5(self, events: list[DAQEvent]) -> None:
         if not self._data_path:
-            self.logger.error("[!] Data path not available. Cannot write HDF5.")
+            self.logger.error(
+                "[!] Data path not available. Cannot write HDF5.")
             return
-        
+
         Path("data/hdf5").mkdir(parents=True, exist_ok=True)
 
-        events_by_producer: dict[str, list[DAQEvent]] = {}
+        events_by_run: dict[str, list[DAQEvent]] = {}
         for event in events:
-            events_by_producer.setdefault(event.producer_id, []).append(event)
+            events_by_run.setdefault(event.run_id, []).append(event)
 
-        for producer_id, producer_events in events_by_producer.items():
-            path = Path("data/hdf5") / f"daq_capture_{producer_id}.hdf5"
+        for run_id, run_events in events_by_run.items():
+            path = Path("data/hdf5") / f"daq_capture_{_safe_filename_part(run_id)}.hdf5"
             with h5py.File(path, "a") as f:
-                dt = h5py.string_dtype(encoding="utf-8")
-                for event in producer_events:
-                    group = f.require_group(str(event.run_id))
-                    base_key = str(event.event_id)
-                    event_key = base_key
-                    if event_key in group:
-                        suffix = 1
-                        while f"{base_key}_{suffix}" in group:
-                            suffix += 1
-                        event_key = f"{base_key}_{suffix}"
-
-                    record = {
-                        "event_id": event.event_id,
-                        "run_id": event.run_id,
-                        "producer_id": event.producer_id,
-                        "source": event.source,
-                        "method": event.method,
-                        "direction": event.direction,
-                        "message": json.dumps(event.data, default=str),
-                    }
-                    dset = group.create_dataset(event_key, (1,), dtype=dt)
-                    dset[0] = json.dumps(record, default=str)
+                f.attrs["run_id"] = str(run_id)
+                for event in run_events:
+                    run_group = f.require_group(str(event.run_id))
+                    event_key = _unique_hdf5_key(run_group, str(event.event_id))
+                    event_group = run_group.create_group(event_key)
+                    event_group.attrs["event_id"] = int(event.event_id)
+                    event_group.attrs["timestamp"] = str(event.timestamp)
+                    event_group.attrs["run_id"] = str(event.run_id)
+                    event_group.attrs["producer_id"] = str(event.producer_id)
+                    event_group.attrs["source"] = str(event.source)
+                    event_group.attrs["method"] = str(event.method)
+                    event_group.attrs["direction"] = str(event.direction)
+                    _write_hdf5_value(event_group, "data", event.data)
 
         self.logger.info("Flushed %d events of type hdf5", len(events))
 
+    ######################################################################################################
+    ################## These functions below are for GUI interaction and manual commits ##################
+    ####################### They will not be executed when decorating a function #########################
+    ######################################################################################################
+
+    def commit(self, *, source: str, method: str, data: dict, direction: str = "out", run_id: str | None = None, producer_id: str | None = None, metadata: dict | None = None, tags: dict | None = None,) -> int:
+        event_data = dict(data)
+        if metadata:
+            event_data["metadata"] = metadata
+        if tags:
+            event_data["tags"] = tags
+
+        pending_event = PendingEvent(
+            event_id=0,  # will be set in publish_pending_event
+            run_id=run_id or get_run_id(),
+            timestamp=str(time.time() * 1000),
+            producer_id=producer_id or "default_producer",
+            source=source,
+            method=method,
+            direction=cast(Literal["in", "out", "error"], direction),
+            data=event_data,
+        )
+
+        self.publish_pending_event(pending_event)
+
+        return pending_event.event_id
+
+    def commit_preview(self, preview: PreviewFrame, *, method: str = "manual_commit", analysis: dict | None = None, user_metadata: dict | None = None, tags: dict | None = None) -> int:
+        metadata = {
+            **preview.metadata,
+            **(user_metadata or {}),
+            "preview_timestamp": preview.timestamp,
+            "preview_sequence_id": preview.sequence_id,
+        }
+
+        return self.commit(
+            source=preview.source,
+            producer_id=preview.producer_id,
+            method=method,
+            data={
+                "preview": preview.data,
+                "analysis": analysis or {},
+            },
+            metadata=metadata,
+            tags=tags,
+        )
 
 
+def _flatten_for_csv(value: Any, *, prefix: str) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        flattened: dict[str, Any] = {}
+        if not value:
+            flattened[prefix] = ""
+        for key, child in value.items():
+            flattened.update(_flatten_for_csv(child, prefix=f"{prefix}.{key}"))
+        return flattened
+
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        flattened = {}
+        if not value:
+            flattened[prefix] = ""
+        for index, child in enumerate(value):
+            flattened.update(_flatten_for_csv(child, prefix=f"{prefix}.{index}"))
+        return flattened
+
+    return {prefix: _csv_scalar(value)}
 
 
+def _csv_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    return str(value)
 
 
+def _safe_filename_part(value: Any) -> str:
+    text = str(value).strip()
+    cleaned = [character if character.isalnum() or character in ("-", "_", ".") else "_" for character in text]
+    return "".join(cleaned).strip("._") or "unknown"
 
-        
+
+def _unique_hdf5_key(group, base_key: str) -> str:
+    event_key = base_key
+    if event_key not in group:
+        return event_key
+    suffix = 1
+    while f"{base_key}_{suffix}" in group:
+        suffix += 1
+    return f"{base_key}_{suffix}"
+
+
+def _safe_hdf5_name(name: Any) -> str:
+    text = str(name).replace("/", "_").strip()
+    return text or "value"
+
+
+def _write_hdf5_value(group, name: str, value: Any) -> None:
+    safe_name = _safe_hdf5_name(name)
+    if isinstance(value, Mapping):
+        child_group = group.create_group(safe_name)
+        if safe_name != str(name):
+            child_group.attrs["original_name"] = str(name)
+        if not value:
+            child_group.attrs["empty"] = True
+        for key, child in value.items():
+            _write_hdf5_value(child_group, str(key), child)
+        return
+
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        if _is_flat_hdf5_sequence(value):
+            data = _flat_hdf5_sequence_data(value)
+            if all(isinstance(item, str) for item in data):
+                group.create_dataset(safe_name, data=data, dtype=h5py.string_dtype("utf-8"))
+            else:
+                group.create_dataset(safe_name, data=data)
+            return
+        child_group = group.create_group(safe_name)
+        if not value:
+            child_group.attrs["empty"] = True
+        for index, child in enumerate(value):
+            _write_hdf5_value(child_group, str(index), child)
+        return
+
+    if value is None:
+        dataset = group.create_dataset(safe_name, data="")
+        dataset.attrs["is_none"] = True
+        return
+
+    if isinstance(value, str):
+        group.create_dataset(safe_name, data=value, dtype=h5py.string_dtype("utf-8"))
+        return
+
+    if isinstance(value, bytes | bytearray):
+        group.create_dataset(safe_name, data=bytes(value))
+        return
+
+    group.create_dataset(safe_name, data=value)
+
+
+def _is_flat_hdf5_sequence(value: Sequence[Any]) -> bool:
+    return all(item is None or isinstance(item, bool | int | float | str) for item in value)
+
+
+def _flat_hdf5_sequence_data(value: Sequence[Any]) -> list[Any]:
+    if any(item is None or isinstance(item, str) for item in value):
+        return ["" if item is None else str(item) for item in value]
+    return list(value)

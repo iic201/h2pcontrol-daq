@@ -6,7 +6,7 @@ import json
 import time
 import csv
 import h5py
-from typing import cast, Literal
+from typing import Any, cast, Literal
 from pathlib import Path
 from h2pcontrol.central_daq.v1.central_daq_pb2 import (
     StreamDAQEventsRequest,
@@ -33,9 +33,9 @@ class CentralDAQService(CentralDAQServiceServicer):
         self._outbound_csv_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
-        self._outbound_jsonl_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
-            maxsize=self.config.outbound_maxsize
-        )
+        # self._outbound_jsonl_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
+        #     maxsize=self.config.outbound_maxsize
+        # )
         self._outbound_influx_q: asyncio.Queue[DAQEvent] = asyncio.Queue(
             maxsize=self.config.outbound_maxsize
         )
@@ -62,7 +62,8 @@ class CentralDAQService(CentralDAQServiceServicer):
         self.tasks = [
             asyncio.create_task(self._ingest_loop()),
             asyncio.create_task(self._outbound_csv_loop()),
-            asyncio.create_task(self._outbound_jsonl_loop()),
+            # Uncomment if you want to output JSONL
+            # asyncio.create_task(self._outbound_jsonl_loop()),
             asyncio.create_task(self._outbound_influx_loop()),
             asyncio.create_task(self._outbound_hdf5_loop()),
         ]
@@ -71,7 +72,8 @@ class CentralDAQService(CentralDAQServiceServicer):
         self.logger.info("[Central-DAQ] Stopping service..")
         await self._ingest_q.join()
         await self._outbound_csv_q.join()
-        await self._outbound_jsonl_q.join()
+        # Uncomment if you want to output JSONL
+        # await self._outbound_jsonl_q.join()
         await self._outbound_influx_q.join()
         await self._outbound_hdf5_q.join()
         for task in self.tasks:
@@ -86,20 +88,21 @@ class CentralDAQService(CentralDAQServiceServicer):
 
     async def accept_event(self, event: StreamDAQEventsRequest) -> None:
         if self._data_path_created:
-            self._create_path_for_source("data/{source}".format(source=event.source))
+            self._create_path_for_source(event.source)
             
         self.stats.ingested += 1
         # TODO: Apply overflow policy for this put
         await self._ingest_q.put(event)
 
     async def StreamDAQEvents(self, request_iterator, context):
+        count = 0
         async for event in request_iterator:
             await self.accept_event(event)
-            self.stats.received += 1
+            count += 1
 
         response = StreamDAQEventsResponse(
             received=200,
-            message="Received {received} events".format(received=self.stats.received),
+            message="Received {received} events".format(received=count),
         )
 
         self.logger.info(
@@ -144,10 +147,11 @@ class CentralDAQService(CentralDAQServiceServicer):
                     source=event.source,
                     method=event.method,
                     direction=cast(Literal["in", "out", "error"], event.direction),
-                    data=event.data,
+                    data=_decode_event_data(event.data),
                 )
                 await self._outbound_csv_q.put(daq_event)
-                await self._outbound_jsonl_q.put(daq_event)
+                # Uncomment if you want to output JSONL
+                # await self._outbound_jsonl_q.put(daq_event)
                 await self._outbound_influx_q.put(daq_event)
                 await self._outbound_hdf5_q.put(daq_event)
             except Exception as e:
@@ -180,20 +184,19 @@ class CentralDAQService(CentralDAQServiceServicer):
             self.logger.error("[Central-DAQ] Data path not created; cannot write CSV")
             return
         
-        path = "data/{source}/csv".format(source=event.source)
-        if not Path(path).is_dir():
+        path = self._data_type_path(event.source, "csv")
+        if not path.is_dir():
             self._create_path_for_data_type(event.source, "csv")
             self.logger.info("[Central-DAQ] Path does not exist, creating one: %s", path)
 
-        if not Path(path).is_dir():
+        if not path.is_dir():
             self.logger.error("[Central-DAQ] Failed to create path for CSV: %s", path)
             return
         
-        file_path = "{path}/{producer_id}.csv".format(path=path, producer_id=event.producer_id)
-        file_path_obj = Path(file_path)
+        file_path_obj = path / f"{_safe_path_part(event.producer_id)}.csv"
         write_header = (not file_path_obj.exists()) or file_path_obj.stat().st_size == 0
 
-        with open(file_path, "a", encoding="utf-8", newline="") as f:
+        with file_path_obj.open("a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "event_id",
                 "timestamp",
@@ -214,7 +217,7 @@ class CentralDAQService(CentralDAQServiceServicer):
                 "source": event.source,
                 "method": event.method,
                 "direction": event.direction,
-                "data": event.data,
+                "data": json.dumps(event.data, default=str),
             })
 
     async def _outbound_jsonl_loop(self) -> None:
@@ -238,16 +241,16 @@ class CentralDAQService(CentralDAQServiceServicer):
             self.logger.error("[Central-DAQ] Data path not created; cannot write JSONL")
             return
         
-        path = "data/{source}/jsonl".format(source=event.source)
-        if not Path(path).is_dir():
+        path = self._data_type_path(event.source, "jsonl")
+        if not path.is_dir():
             self._create_path_for_data_type(event.source, "jsonl")
             self.logger.info("[Central-DAQ] Path does not exist, creating one: %s", path)
         
-        if not Path(path).is_dir():
+        if not path.is_dir():
             self.logger.error("[Central-DAQ] Failed to create path for JSONL: %s", path)
             return
         
-        file_path = "{path}/{producer_id}.jsonl".format(path=path, producer_id=event.producer_id)
+        file_path = path / f"{_safe_path_part(event.producer_id)}.jsonl"
 
         json_line = json.dumps({
             "event_id": event.event_id,
@@ -305,27 +308,28 @@ class CentralDAQService(CentralDAQServiceServicer):
             self.logger.error("[Central-DAQ] Data path not created; cannot write HDF5")
             return
         
-        path = "data/{source}/hdf5".format(source=event.source)
-        if not Path(path).is_dir():
+        path = self._data_type_path(event.source, "hdf5")
+        if not path.is_dir():
             self._create_path_for_data_type(event.source, "hdf5")
             self.logger.info("[Central-DAQ] Path does not exist, creating one: %s", path)
 
-        if not Path(path).is_dir():
+        if not path.is_dir():
             self.logger.error("[Central-DAQ] Failed to create path for HDF5: %s", path)
             return
         
-        file_path = "{path}/{source}.hdf5".format(path=path, source=event.source)
+        file_path = path / f"{_safe_path_part(event.source)}.hdf5"
         with h5py.File(file_path, "a") as f:
             producers_group = f.require_group("producers")
-            producer_group = producers_group.require_group(str(event.producer_id))
+            producer_group = producers_group.require_group(_safe_hdf5_name(event.producer_id))
+            producer_group.attrs["producer_id"] = str(event.producer_id)
             events_group = producer_group.require_group("events")
-            group_name = str(event.event_id)
+            group_name = _safe_hdf5_name(event.event_id)
             if group_name in events_group:
-                group_name = "{event_id}_{timestamp}_{nonce}".format(
+                group_name = _safe_hdf5_name("{event_id}_{timestamp}_{nonce}".format(
                     event_id=event.event_id,
                     timestamp=event.timestamp,
                     nonce=time.time_ns(),
-                )
+                ))
             event_group = events_group.create_group(group_name)
             event_group.attrs["timestamp"] = event.timestamp
             event_group.attrs["run_id"] = event.run_id
@@ -336,11 +340,38 @@ class CentralDAQService(CentralDAQServiceServicer):
             # Assuming data is JSON-serializable; if not, this will need to be adapted.
             event_group.create_dataset("data", data=json.dumps(event.data, default=str))
 
-    def _create_path_for_source(self, path: str) -> bool:
-        Path(path).mkdir(parents=True, exist_ok=True)
+    def _source_path(self, source: str) -> Path:
+        return Path("data") / _safe_path_part(source)
+
+    def _data_type_path(self, source: str, data_type: str) -> Path:
+        return self._source_path(source) / _safe_path_part(data_type)
+
+    def _create_path_for_source(self, source: str) -> bool:
+        self._source_path(source).mkdir(parents=True, exist_ok=True)
         return True
     
     def _create_path_for_data_type(self, source: str, data_type: str) -> bool:
-        path = "data/{source}/{data_type}".format(source=source, data_type=data_type)
-        Path(path).mkdir(parents=True, exist_ok=True)
+        self._data_type_path(source, data_type).mkdir(parents=True, exist_ok=True)
         return True
+
+
+def _decode_event_data(value: str) -> Any:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _safe_path_part(value: Any) -> str:
+    text = str(value).strip()
+    cleaned = [
+        character if character.isalnum() or character in ("-", "_") else "_"
+        for character in text
+    ]
+    return "".join(cleaned).strip("_") or "unknown"
+
+
+def _safe_hdf5_name(value: Any) -> str:
+    return _safe_path_part(value)

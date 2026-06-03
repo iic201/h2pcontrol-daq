@@ -1,74 +1,279 @@
 # h2pcontrol-daq
 
-This is the daq (data acquisition) component of the h2pcontrol system. It is responsible for acquiring data from various sensors and devices,
-and sending it to the h2pcontrol-daq server for processing, storage and UI.
+`h2pcontrol-daq` contains the DAQ-side tools used by H2PControl servers:
 
-There are two parts of this project, the first one is the h2pcontrol-daq server [`h2pcontrol-daq/server`], which is responsible for receiving data from the device servers and processing it,
-and the second one is the h2pcontrol-daq package [`h2pcontrol-daq/lib`], which is responsible for giving an easy interface to the device servers to send data to the h2pcontrol-daq server.
+- a reusable Python package for local capture and preview buffering (`lib/`)
+- an optional central DAQ gRPC receiver (`central-server/`)
+- a generic preview GUI for servers that implement `h2pcontrol.gui.v1.GuiService` (`gui/`)
 
-## Installation for the package
+The current project is not one monolithic server. Instrument servers usually import the `lib/` package, expose their own control gRPC service, optionally expose `GuiService` for live preview, and can stream committed events to the central DAQ.
 
-For the installation of the python package (the `h2pcontrol-daq/lib`), you just have to do the following and the package will be installed:
+## Repository Layout
 
-```bash
-pip install git+https://github.com/iic201/h2pcontrol-daq.git#subdirectory=lib
+```text
+h2pcontrol-daq/
+├── lib/               # Python package: LocalDAQ, capture decorator, preview buffer
+├── central-server/    # Optional central DAQ gRPC ingest service on port 50052
+├── gui/               # h2pgui preview application
+└── README.md
 ```
 
-It can be installed like this because it is released on Github. If you wan to install from a specific version, you can do it like this:
+## Local DAQ Package
+
+The package in `lib/` is installed by instrument servers that want local capture, local persistence, GUI preview buffering, and optional streaming to central DAQ.
+
+Install from this repository:
 
 ```bash
-pip install git+https://github.com/iic201/h2pcontrol-daq.git@v1.0.0#subdirectory=lib
+uv add "h2pcontrol-daq @ git+https://github.com/iic201/h2pcontrol-daq.git#subdirectory=lib"
 ```
 
-For a description of the current local DAQ implementation, see [lib/readme-local-daq.md](lib/readme-local-daq.md).
+Install a specific tag:
 
-## Design
+```bash
+uv add "h2pcontrol-daq @ git+https://github.com/iic201/h2pcontrol-daq.git@v1.0.0#subdirectory=lib"
+```
 
-The design and interaction between the components of the h2pcontrol-daq system and the h2pcontrol is as follows:
+Main exports:
+
+```python
+from h2pcontrol_daq import (
+    LocalDAQ,
+    capture,
+    DAQConfig,
+    OverflowPolicy,
+    PreviewBuffer,
+    PreviewFrame,
+)
+```
+
+Typical use:
+
+```python
+from h2pcontrol_daq import LocalDAQ, capture
+
+daq = LocalDAQ()
+
+@capture(daq, source="counter", direction="both")
+async def read_counter(...):
+    ...
+```
+
+Start the background writer tasks when your server starts:
+
+```python
+await daq.start()
+```
+
+Stop and flush queues during shutdown:
+
+```python
+await daq.stop()
+```
+
+### Local Files
+
+`LocalDAQ` writes under the current working directory of the process using it:
+
+```text
+data/csv/daq_capture_<run_id>.csv
+data/hdf5/daq_capture_<run_id>.hdf5
+.logs/daq-info.log
+.logs/daq-error.log
+```
+
+The `run_id` is generated once per Python process. Decorated captures and manual GUI/preview commits now use the same generated run id unless a caller explicitly passes one.
+
+Current format behavior:
+
+- CSV flattens nested event data into columns such as `data.preview.state.value`.
+- HDF5 stores event metadata as attributes and nested event data as groups/datasets.
+
+### Local InfluxDB Writes
+
+`LocalDAQ` can also write committed events directly to a local or reachable InfluxDB instance. It is disabled by default:
+
+```python
+from h2pcontrol_daq import DAQConfig, LocalDAQ
+
+daq = LocalDAQ(
+    DAQConfig(
+        enable_local_influx=True,
+        influxdb_url="http://localhost:8086",
+        influxdb_token="...",
+        influxdb_org="beyer-labs",
+        influxdb_bucket="h2pcontrol",
+    )
+)
+```
+
+These values can also come from environment variables:
+
+```text
+INFLUXDB_URL
+INFLUXDB_TOKEN or INFLUXDB_ADMIN_TOKEN
+INFLUXDB_ORG
+INFLUXDB_BUCKET
+INFLUXDB_MEASUREMENT_PREFIX
+```
+
+Local Influx measurements are named `<measurement_prefix>_<source>`, for example `daq_counter`. Run/source/method metadata are written as tags. To keep the time-series schema compact, only finite numeric and boolean measurement values are written as fields; bulky descriptive subtrees such as `analysis`, `metadata`, `tags`, and board/static info stay in JSONL/CSV/HDF5.
+
+See [lib/readme-local-daq.md](lib/readme-local-daq.md) for the local DAQ flow in more detail.
+
+## Preview Buffer
+
+`PreviewBuffer` is a lightweight in-memory buffer used by instrument servers to keep the latest GUI-facing measurement frames.
+
+It stores:
+
+- latest frame per source
+- recent history per source
+- monotonically increasing sequence IDs per source
+
+Servers use it like this:
+
+```python
+preview = preview_buffer.update(
+    source="magnetic_field",
+    producer_id="mmc3416-bfield-monitor",
+    data={"state": state_dict},
+    metadata={"proto": "mmc3416.v1.Mmc3416State"},
+)
+```
+
+Instrument servers then convert these `PreviewFrame`s into `h2pcontrol.gui.v1.Frame` messages for the GUI.
+
+## Instrument Preview GUI
+
+The GUI package in `gui/` provides `h2pgui`, a generic live preview app for servers that expose:
+
+```proto
+h2pcontrol.gui.v1.GuiService
+```
+
+Run from the repository:
+
+```bash
+uv --project gui run h2pgui
+```
+
+Connect directly to a GUI service:
+
+```bash
+uv --project gui run h2pgui --target 127.0.0.1:5055
+```
+
+Use a non-default manager address for service discovery:
+
+```bash
+uv --project gui run h2pgui --manager-addr 127.0.0.1:50051
+```
+
+The GUI can:
+
+- discover registered services through the h2pcontrol manager
+- connect directly to a target address
+- stream scalar, vector, array, or struct-like preview frames
+- plot numeric values over time
+- select a time interval on the plot
+- ask the server to save that interval with `SaveInterval`
+- save the selected GUI buffer locally with `Save local`
+- calculate a trapezoidal integral over the selected time interval
+- start/stop remote preview streaming if the server implements those controls
+
+Local GUI exports are written where `h2pgui` is running:
+
+```text
+data/gui_exports/<target>/<source>_<timestamp>_<start>_<end>/
+├── frames.jsonl
+├── points.csv
+└── manifest.json
+```
+
+Remote `Save selection` is different: it calls the server's `SaveInterval` RPC and the server commits selected preview frames through its own `LocalDAQ`.
+
+## Central DAQ Server
+
+`central-server/` contains an optional central gRPC receiver for committed DAQ events. It listens on port `50052` by default:
+
+```bash
+uv --project central-server run python main.py
+```
+
+Instrument-side `LocalDAQ` can stream events to it through `GrpcDAQSink` when `DAQConfig.enable_central_stream` is enabled.
+
+The current central service:
+
+- implements `h2pcontrol.central_daq.v1.CentralDAQService/StreamDAQEvents`
+- ingests streamed DAQ events into async queues
+- writes CSV, JSONL, and HDF5 under `central-server/data/<source>/...`
+- attempts to write to InfluxDB using configuration from `.env`
+
+InfluxDB settings are read from environment variables or `.env` files:
+
+```text
+INFLUXDB_URL
+INFLUXDB_ADMIN_TOKEN
+INFLUXDB_ORG
+INFLUXDB_BUCKET
+INFLUXDB_MEASUREMENT_PREFIX
+```
+
+There is a setup helper under:
+
+```text
+central-server/scripts/influxdb_setup.py
+```
+
+## Current Data Flow
 
 ```mermaid
 flowchart LR
-    subgraph Producers["Data producers"]
-        S1["Server A<br/>imports DAQ package<br/>Decorates function (local daq pipeline)"]
-        S2["Server B<br/>imports DAQ package<br/>Decorates function (local daq pipeline)"]
-        S3["Server C<br/>imports DAQ package<br/>Decorates function (local daq pipeline)"]
+    subgraph Server["Instrument server"]
+        Method["Async control/read method"]
+        Capture["capture(...) decorator"]
+        Preview["PreviewBuffer"]
+        GuiSvc["GuiService"]
+        Local["LocalDAQ"]
     end
 
-    subgraph Core["Central DAQ"]
-        COL["DAQ Collector / Ingest"]
-        Q["Internal queue / buffer"]
-        IFX["InfluxDB"]
-        H5["HDF5 archive"]
-        CSV["CSV export folder"]
+    subgraph LocalFiles["Server-local files"]
+        JSONL["data/jsonl/daq_capture_<run_id>.jsonl"]
+        CSV["data/csv/daq_capture_<run_id>.csv"]
+        HDF5["data/hdf5/daq_capture_<run_id>.hdf5"]
+        LocalInflux["InfluxDB"]
     end
 
-    subgraph App["UI layer"]
-        API["Custom UI backend API"]
-        UI["Custom Python UI"]
-        G["Grafana"]
+    subgraph GUI["h2pgui"]
+        Plot["Live plot"]
+        LocalExport["Save local"]
+        RemoteSave["Save selection"]
     end
 
-    S1 --> COL
-    S2 --> COL
-    S3 --> COL
+    subgraph Central["Optional central DAQ"]
+        CentralSvc["CentralDAQService"]
+        CentralFiles["central data/"]
+        Influx["InfluxDB"]
+    end
 
-    COL --> Q
-    Q --> IFX
-    Q --> H5
-    Q --> CSV
-
-    API --> H5
-    API --> CSV
-    API --> COL
-
-    UI --> API
-    G --> IFX
-    UI -.->|"open/embed dashboards"| G
+    Method --> Capture --> Local
+    Method --> Preview --> GuiSvc
+    GuiSvc --> Plot
+    Plot --> LocalExport
+    RemoteSave --> GuiSvc --> Local
+    Local --> JSONL
+    Local --> CSV
+    Local --> HDF5
+    Local -. optional local write .-> LocalInflux
+    Local -. optional stream .-> CentralSvc
+    CentralSvc --> CentralFiles
+    CentralSvc --> Influx
 ```
 
-Each server imports the lib package (`h2pcontrol-daq/lib`) and uses it to decorate the functions. This decorator then creates a local pipeline for the data
-(see the `h2pcontrol-daq/lib/pipeline.py` file for more details) and sends the data to the central DAQ server (`h2pcontrol-daq/server`).
-Note that this part of sending it to the central DAQ is optional, and the local pipeline can be used without sending it to the central DAQ server.
-However, if the data is sent to the central DAQ server, it will be processed and stored in the central InfluxDB, HDF5 archive and CSV export folder.
-For now, the central pipeline subscribes to the producer UI broadcaster, relays those events into the central ingest queue, and then the ingest layer stores them in the central InfluxDB, HDF5 archive and CSV export folder.
-The UI layer then interacts with the central DAQ server to retrieve the data and display it to the user. Grafana is used to visualize the data from the InfluxDB, while the custom Python UI can retrieve data from the central DAQ server and display it in a custom way.
+## Notes
+
+- The local DAQ package targets async producer methods.
+- GUI preview uses the generated `h2pcontrol.gui.v1` Python protobuf package from the Buf-generated H2PControl dependencies.
+- The central server is optional. Local files are still written even when central streaming is disabled.
+- The GUI and central server are separate Python projects with their own `pyproject.toml` and virtual environments.
