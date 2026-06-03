@@ -1,89 +1,172 @@
 ## Local DAQ
 
-The local DAQ package is the client-side capture layer for the h2pcontrol system. Its purpose is to intercept method calls in a producer service, turn them into structured events, and persist those events locally in a few simple formats.
+The local DAQ package is the producer-side capture layer for H2PControl instrument servers. Its purpose is to turn method calls and GUI preview commits into structured `DAQEvent`s, persist them locally, and optionally stream them to a central DAQ service.
 
 ```mermaid
 flowchart TB
-	A[Producer service] --> B[capture(...) ]
-	B --> C[PendingEvent inbound]
-	C --> D[LocalDAQ ingress queue]
-	D --> E[Serializer task]
-	E --> F[DAQEvent]
-	F --> G[JSONL writer]
-	F --> H[CSV writer]
-	F --> I[HDF5 writer]
+    A[Producer service] --> B[capture(...) decorator]
+    B --> C[PendingEvent]
+    C --> D[LocalDAQ ingress queue]
+    D --> E[Serializer task]
+    E --> F[DAQEvent]
+    F --> G[JSONL writer]
+    F --> H[CSV writer]
+    F --> I[HDF5 writer]
+    F -. optional .-> J[Central DAQ gRPC sink]
+    F -. optional .-> P[Local InfluxDB writer]
 
-	G --> J[data/jsonl/daq_capture_<producer_id>.jsonl]
-	H --> K[data/csv/daq_capture_<producer_id>.csv]
-	I --> L[data/hdf5/daq_capture_<producer_id>.hdf5]
+    G --> K["data/jsonl/daq_capture_<run_id>.jsonl"]
+    H --> L["data/csv/daq_capture_<run_id>.csv"]
+    I --> M["data/hdf5/daq_capture_<run_id>.hdf5"]
+    P --> Q["InfluxDB bucket"]
 
-	E -. publishes metrics .-> M[LocalDAQStats]
-	G -. logs .-> N[.logs/daq-info.log]
-	H -. logs .-> N
-	I -. logs .-> N
+    E -. stats .-> N[LocalDAQStats]
+    G -. logs .-> O[.logs/daq-info.log]
+    H -. logs .-> O
+    I -. logs .-> O
 ```
 
-### Complexity
+### Current Flow
 
-The current per-event control flow is:
+1. A producer creates a `LocalDAQ` instance.
+2. The producer starts it with `await daq.start()`.
+3. Async methods can be decorated with `capture(...)`.
+4. The decorator creates a `PendingEvent` before the wrapped method runs when `direction` includes `in`.
+5. The decorator creates another `PendingEvent` after the method returns when `direction` includes `out`.
+6. `LocalDAQ.publish_pending_event(...)` assigns a monotonically increasing event id.
+7. The serializer task converts each `PendingEvent` into a `DAQEvent`.
+8. The event is fanned out to JSONL, CSV, HDF5, and optionally central gRPC and local InfluxDB writer queues.
+9. `await daq.stop()` flushes queues and cancels writer tasks during shutdown.
 
-- `capture(...)`: time `O(1)`, space `O(1)` per call, excluding the wrapped producer method.
-- `PendingEvent` creation: time `O(1)`, space `O(1)`.
-- Ingress queue enqueue: time `O(1)`, space `O(q)` for queued events.
-- Serializer task: time `O(1)` per event, space `O(1)`.
-- `DAQEvent` creation: time `O(1)`, space `O(1)`.
-- JSONL writer: time `O(1)` append per event, space `O(1)`.
-- CSV writer: time `O(1)` append per event, space `O(1)`.
-- HDF5 writer: time `O(1)` append per event in the current design, space `O(1)`.
-- `LocalDAQStats` updates: time `O(1)`, space `O(1)`.
+Manual preview commits use the same pipeline through:
 
-The generated files grow on disk over time, but that file growth is not counted as in-memory working space.
+```python
+daq.commit_preview(preview, method="manual_interval")
+```
 
-### Current flow
+This is what GUI `SaveInterval` handlers call in instrument servers.
 
-1. A producer decorates an async method with `capture(...)`.
-2. The decorator creates a `PendingEvent` before the wrapped method runs when `direction` includes `in`.
-3. After the wrapped method returns, it creates another `PendingEvent` when `direction` includes `out`.
-4. Each pending event is published into `LocalDAQ`, which assigns a monotonically increasing event id and queues the event for serialization.
-5. `LocalDAQ` serializes the event into a `DAQEvent` and fans it out to three writer queues.
-6. Separate background writers persist the data to JSONL, CSV, and HDF5 files under the local `data/` folder.
+### Run IDs
 
-### What it stores
+The package generates one `run_id` per Python process. Decorated captures and manual commits use this generated run id unless a caller explicitly passes a different one.
 
-The captured event payload includes:
+That means files are grouped by run:
+
+```text
+data/jsonl/daq_capture_<run_id>.jsonl
+data/csv/daq_capture_<run_id>.csv
+data/hdf5/daq_capture_<run_id>.hdf5
+```
+
+### What It Stores
+
+Each event contains:
 
 - `event_id`
+- `timestamp`
 - `run_id`
 - `producer_id`
 - `source`
 - `method`
 - `direction`
-- `message` or `data`
+- `data`
 
-The decorator currently records the selected input arguments and keyword arguments on the inbound event, and JSON-serializes the return value on the outbound event.
+For decorated methods, inbound events contain selected args/kwargs and outbound events contain the returned result.
 
-### Runtime behavior
+For preview commits, event data contains:
 
-The current implementation is asynchronous and queue-based. `LocalDAQ` starts one serializer task and one writer task for each output format, so the wrapped producer method does not block on file I/O during normal operation.
+- `preview`
+- `analysis`
+- optional `metadata`
+- optional `tags`
 
-The package also keeps basic runtime counters for:
+### File Formats
+
+JSONL keeps the event shape directly:
+
+```json
+{"event_id": 1, "run_id": "...", "source": "counter", "data": {...}}
+```
+
+CSV is tabular. Common event fields are normal columns, and nested `data` fields are flattened:
+
+```text
+event_id,timestamp,run_id,producer_id,source,method,direction,data.preview.state.value
+```
+
+HDF5 is hierarchical. Each event is stored under:
+
+```text
+/<run_id>/<event_id>/
+```
+
+Event metadata is stored as HDF5 attributes. Nested event data is stored as HDF5 groups and datasets under `data`.
+
+### Runtime Behavior
+
+The implementation is asynchronous and queue-based. The wrapped producer method does not normally block on file I/O because writers run in background tasks.
+
+Runtime counters track:
 
 - published events
 - serialized events
 - dropped ingress events
-- dropped outbound events per format
+- dropped outbound CSV events
+- dropped outbound HDF5 events
+- dropped outbound JSONL events
+- dropped outbound central-stream events
+- dropped outbound InfluxDB events
 - serialization errors
 
-Queue overflow is controlled by `OverflowPolicy`, which can drop the newest item, drop the oldest item, or block with a timeout.
+Queue overflow is controlled by `OverflowPolicy`:
 
-### Files written by the current implementation
+- `DROP_NEWEST`
+- `DROP_OLDEST`
+- `BLOCK_WITH_TIMEOUT`
 
-- `data/jsonl/daq_capture_<producer_id>.jsonl`
-- `data/csv/daq_capture_<producer_id>.csv`
-- `data/hdf5/daq_capture_<producer_id>.hdf5`
-- `.logs/daq-info.log`
-- `.logs/daq-error.log`
+### Central Streaming
 
-### Notes on the current state
+`LocalDAQ` creates a `GrpcDAQSink` for optional central streaming. By default it targets:
 
-This is still a local capture pipeline, not a central server. It is useful for validating the producer-side instrumentation, inspecting event shape, and keeping a lightweight on-disk record of captured method calls. The code currently targets async producer methods, so synchronous methods would need an additional wrapper if they should be captured the same way.
+```text
+127.0.0.1:50052
+```
+
+Central streaming is controlled by `DAQConfig.enable_central_stream`.
+
+### Local InfluxDB
+
+Local InfluxDB writes are controlled by `DAQConfig.enable_local_influx`. When enabled, every committed `DAQEvent` is written as an Influx point in addition to the local files.
+
+```python
+from h2pcontrol_daq import DAQConfig, LocalDAQ
+
+daq = LocalDAQ(
+    DAQConfig(
+        enable_local_influx=True,
+        influxdb_url="http://localhost:8086",
+        influxdb_token="...",
+        influxdb_org="beyer-labs",
+        influxdb_bucket="h2pcontrol",
+    )
+)
+```
+
+Configuration can also come from:
+
+```text
+INFLUXDB_URL
+INFLUXDB_TOKEN or INFLUXDB_ADMIN_TOKEN
+INFLUXDB_ORG
+INFLUXDB_BUCKET
+INFLUXDB_MEASUREMENT_PREFIX
+```
+
+The writer uses `<measurement_prefix>_<source>` as the measurement name. It stores `run_id`, `producer_id`, `source`, `method`, and `direction` as tags. It stores only finite numeric and boolean measurement values as fields. Bulky descriptive subtrees such as `analysis`, `metadata`, `tags`, and board/static info stay in JSONL/CSV/HDF5 instead of being expanded into InfluxDB fields.
+
+### Notes
+
+- The decorator currently targets async methods.
+- Synchronous methods would need a separate wrapper.
+- The local files are written relative to the current working directory of the server process.
+- The local DAQ package can be used without running the central DAQ server.

@@ -1,4 +1,4 @@
-from src.central import CentralDAQService
+from central.central import CentralDAQService
 import asyncio
 import grpc
 from h2pcontrol.central_daq.v1.central_daq_pb2_grpc import (

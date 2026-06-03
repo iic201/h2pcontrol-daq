@@ -1,26 +1,17 @@
 from __future__ import annotations
 import functools
 import json
-import uuid
-from datetime import datetime, time
+from datetime import datetime
 import os
 import socket
-import time
 from typing import Any, Sequence
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message
-from .pipeline import LocalDAQ
+from .pipeline import LocalDAQ, get_run_id
 from .models import PendingEvent
 
 # TODO: The run id at the moment is not unique per client program, but per capture session. 
 # We may want to make it unique per client program in the future.
-
-_PROCESS_START_NS = time.time_ns()
-_RAW_RUN_ID = f"{socket.gethostname()}_{os.getpid()}_{_PROCESS_START_NS}"
-_RUN_ID = uuid.uuid5(uuid.NAMESPACE_DNS, _RAW_RUN_ID).hex
-
-def get_run_id() -> str:
-    return str(_RUN_ID)
 
 def _pick_args(args: Sequence[Any], indices: Sequence[int] | None):
     if indices is None:

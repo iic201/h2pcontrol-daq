@@ -1,6 +1,7 @@
 from .capture import capture
-from .models import DAQEvent, PendingEvent, OverflowPolicy, DAQConfig
+from .models import DAQConfig, OverflowPolicy, DAQEvent, PendingEvent
 from .pipeline import LocalDAQ
+from .buffer import PreviewBuffer, PreviewFrame
 
 __all__ = [
     "capture",
@@ -9,4 +10,6 @@ __all__ = [
     "DAQEvent",
     "PendingEvent",
     "LocalDAQ",
+    "PreviewBuffer",
+    "PreviewFrame",
 ]

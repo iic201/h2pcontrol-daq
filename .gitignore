@@ -10,5 +10,5 @@ dist/
 .env
 .logs
 data/
-scripts/
 *.txt
+protos/
