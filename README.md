@@ -238,7 +238,6 @@ flowchart LR
     end
 
     subgraph LocalFiles["Server-local files"]
-        JSONL["data/jsonl/daq_capture_<run_id>.jsonl"]
         CSV["data/csv/daq_capture_<run_id>.csv"]
         HDF5["data/hdf5/daq_capture_<run_id>.hdf5"]
         LocalInflux["InfluxDB"]
@@ -261,7 +260,6 @@ flowchart LR
     GuiSvc --> Plot
     Plot --> LocalExport
     RemoteSave --> GuiSvc --> Local
-    Local --> JSONL
     Local --> CSV
     Local --> HDF5
     Local -. optional local write .-> LocalInflux
