@@ -101,12 +101,12 @@ class CentralDAQService(CentralDAQServiceServicer):
             count += 1
 
         response = StreamDAQEventsResponse(
-            received=200,
+            received=count,
             message="Received {received} events".format(received=count),
         )
 
         self.logger.info(
-            "[Central-DAQ] Stream closed: received=200 message=%s",
+            "[Central-DAQ] Stream closed: received={received} message={message}",
             response.message
         )
         return response

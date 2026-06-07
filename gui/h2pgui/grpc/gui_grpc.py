@@ -12,14 +12,12 @@ from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
 from google.protobuf.timestamp_pb2 import Timestamp
 from h2pcontrol.manager.v1 import manager_pb2
-from h2pcontrol.gui.v1 import gui_service_pb2 as pb2
-from h2pcontrol.gui.v1 import gui_service_pb2_grpc as pb2_grpc
+from h2pcontrol.gui.v2 import gui_service_pb2 as pb2
+from h2pcontrol.gui.v2 import gui_service_pb2_grpc as pb2_grpc
 
 # GuiService implements the following gRPC API for instrument preview data:
 # service GuiService {
 #   rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
-#   rpc Start(StartRequest) returns (StartResponse);
-#   rpc Stop(StopRequest) returns (StopResponse);
 #   rpc GetLatest(GetLatestRequest) returns (GetLatestResponse);
 #   rpc StreamFrames(StreamFramesRequest) returns (stream StreamFramesResponse);
 #   rpc SaveInterval(SaveIntervalRequest) returns (SaveIntervalResponse);
@@ -98,13 +96,20 @@ class GuiServiceClient:
     # @param interval_seconds: Minimum interval between frames in seconds
     # @param emit_on_change_only: If true, only emit frames when data changes
     def stream_frames(self, *, source: str = "", interval_seconds: float = 0.1, emit_on_change_only: bool = True,) -> Iterable[Any]:
+        for response in self.open_frame_stream(
+            source=source,
+            interval_seconds=interval_seconds,
+            emit_on_change_only=emit_on_change_only,
+        ):
+            yield response.frame
+
+    def open_frame_stream(self, *, source: str = "", interval_seconds: float = 0.1, emit_on_change_only: bool = True):
         request = pb2.StreamFramesRequest(
             source=source,
             interval_seconds=interval_seconds,
             emit_on_change_only=emit_on_change_only,
         )
-        for response in self.stub.StreamFrames(request):
-            yield response.frame
+        return self.stub.StreamFrames(request)
 
     # Save an interval of frames and flow through the pipeline
     # @param source: The data source for the interval
@@ -146,16 +151,6 @@ class GuiServiceClient:
             timeout=timeout,
         )
         return response
-
-    # Start the data stream on the service
-    # @param timeout: gRPC call timeout in seconds
-    def start(self, timeout: float | None = 5.0):
-        return self.stub.Start(pb2.StartRequest(), timeout=timeout)
-
-    # Stop the data stream on the service
-    # @param timeout: gRPC call timeout in seconds
-    def stop(self, timeout: float | None = 5.0):
-        return self.stub.Stop(pb2.StopRequest(), timeout=timeout)
 
 
 MAX_ARRAY_SERIES = 128

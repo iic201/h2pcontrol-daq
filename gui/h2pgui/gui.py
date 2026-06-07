@@ -66,6 +66,9 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
         self.services_q: queue.Queue[list[ServiceStatus]] = queue.Queue()
         self.errors_q: queue.Queue[str] = queue.Queue()
         self.stop_event = threading.Event()
+        self.stream_paused_event = threading.Event()
+        self._active_stream_call: Any | None = None
+        self._stream_call_lock = threading.Lock()
         self.series: dict[str, Series] = defaultdict(lambda: Series(deque()))
         self.curves: dict[str, pg.PlotDataItem] = {}
         self.series_colors: dict[str, str] = {}
@@ -184,6 +187,31 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             self.selection_region.blockSignals(False)
         self._selection_region_changed()
 
+    def _clear_display_data(self, checked: bool = False, *, announce: bool = True) -> None:
+        _ = checked
+        self.points_q = queue.Queue()
+        self.frames_q = queue.Queue()
+        self.series.clear()
+        self.curves.clear()
+        self.series_colors.clear()
+        self._color_cycle = cycle(self.series_palette)
+        self.frame_history.clear()
+        self.latest_timestamp = None
+        self.latest_frame = None
+        self.latest_text.clear()
+        self.plot_widget.clear()
+        self.plot_widget.addLegend(offset=(12, 12))
+        if self.selection_region is not None:
+            self.selection_region.setParentItem(self.plot_widget.getPlotItem())
+            self.plot_widget.addItem(self.selection_region)
+        if self.selection_label is not None:
+            self.selection_label.setText("")
+            self.selection_label.setParentItem(self.plot_widget.getPlotItem())
+            self.plot_widget.addItem(self.selection_label, ignoreBounds=True)
+        self._refresh_plot()
+        if announce:
+            self._set_status("GUI data cleared")
+
     def _record_frame(self, frame: Any) -> None:
         timestamp = self._frame_timestamp(frame)
         self.latest_frame = frame
@@ -236,6 +264,14 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             return
         self._switch_target(self.target, source=source)
 
+    def _cancel_active_stream(self) -> None:
+        with self._stream_call_lock:
+            stream_call = self._active_stream_call
+        if stream_call is not None:
+            try:
+                stream_call.cancel()
+            except Exception:
+                pass
 
     def _start_stream(self) -> None:
         thread = threading.Thread(target=self._stream_worker, daemon=True)
@@ -265,18 +301,28 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
 
     def _stream_worker(self) -> None:
         while not self.stop_event.is_set():
+            if self.stream_paused_event.is_set():
+                time.sleep(0.1)
+                continue
             client = self.client
             if client is None:
                 time.sleep(0.2)
                 continue
+            stream_call = None
             try:
-                for frame in client.stream_frames(
+                stream_call = client.open_frame_stream(
                     source=self.source,
                     interval_seconds=self.interval_seconds,
                     emit_on_change_only=True,
-                ):
+                )
+                with self._stream_call_lock:
+                    self._active_stream_call = stream_call
+                for response in stream_call:
                     if self.stop_event.is_set():
                         return
+                    if self.stream_paused_event.is_set():
+                        break
+                    frame = response.frame
                     self.frames_q.put(frame)
                     try:
                         self.points_q.put(frame_to_points(frame))
@@ -284,11 +330,20 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
                         self.points_q.put([])
                         self.errors_q.put(f"Frame parse error: {exc}")
             except grpc.RpcError as exc:
+                if self.stop_event.is_set():
+                    return
+                if exc.code() == grpc.StatusCode.CANCELLED:
+                    continue
                 self.errors_q.put(f"Stream error: {exc.code().name} {exc.details()}")
                 time.sleep(1.0)
             except Exception as exc:
                 self.errors_q.put(f"Stream error: {exc}")
                 time.sleep(1.0)
+            finally:
+                if stream_call is not None:
+                    with self._stream_call_lock:
+                        if self._active_stream_call is stream_call:
+                            self._active_stream_call = None
 
     def _tick(self) -> None:
         changed = False
@@ -401,30 +456,13 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             self._set_status("Select a server first")
             return
         self.target_edit.setText(target)
+        self._cancel_active_stream()
         if self.client is not None:
             self.client.close()
         self.client = GuiServiceClient(target)
         self.target = target
         self.source = source
-        self.points_q = queue.Queue()
-        self.frames_q = queue.Queue()
-        self.series.clear()
-        self.curves.clear()
-        self.series_colors.clear()
-        self._color_cycle = cycle(self.series_palette)
-        self.frame_history.clear()
-        self.latest_timestamp = None
-        self.latest_frame = None
-        self.latest_text.clear()
-        self.plot_widget.clear()
-        self.plot_widget.addLegend(offset=(12, 12))
-        if self.selection_region is not None:
-            self.selection_region.setParentItem(self.plot_widget.getPlotItem())
-            self.plot_widget.addItem(self.selection_region)
-        if self.selection_label is not None:
-            self.selection_label.setParentItem(self.plot_widget.getPlotItem())
-            self.plot_widget.addItem(self.selection_label, ignoreBounds=True)
-        self._refresh_plot()
+        self._clear_display_data(announce=False)
         self._load_info()
 
     def _record_point(self, point: PreviewPoint) -> None:
@@ -820,28 +858,30 @@ class InstrumentPreviewWindow(QtWidgets.QMainWindow):
             lines.extend(["", "payload:", _compact_json(payload)])
         self.latest_text.setPlainText("\n".join(lines))
 
-    def _start_remote(self) -> None:
+    def _start_local_stream(self) -> None:
         if self.client is None:
             self._set_status("Select and connect to a server first")
             return
-        try:
-            response = self.client.start()
-            self._set_status(f"running={response.running}")
-        except Exception as exc:
-            self._set_status(f"Start failed: {exc}")
+        if not self.stream_paused_event.is_set():
+            self._set_status("Preview stream is already running")
+            return
+        self.stream_paused_event.clear()
+        self._set_status("Preview stream started")
 
-    def _stop_remote(self) -> None:
+    def _stop_local_stream(self) -> None:
         if self.client is None:
             self._set_status("Select and connect to a server first")
             return
-        try:
-            response = self.client.stop()
-            self._set_status(f"running={response.running}")
-        except Exception as exc:
-            self._set_status(f"Stop failed: {exc}")
+        if self.stream_paused_event.is_set():
+            self._set_status("Preview stream is already stopped")
+            return
+        self.stream_paused_event.set()
+        self._cancel_active_stream()
+        self._set_status("Preview stream stopped")
 
     def close(self) -> None:
         self.stop_event.set()
+        self._cancel_active_stream()
         if self.client is not None:
             self.client.close()
 

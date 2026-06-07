@@ -10,9 +10,6 @@ from google.protobuf.message import Message
 from .pipeline import LocalDAQ, get_run_id
 from .models import PendingEvent
 
-# TODO: The run id at the moment is not unique per client program, but per capture session. 
-# We may want to make it unique per client program in the future.
-
 def _pick_args(args: Sequence[Any], indices: Sequence[int] | None):
     if indices is None:
         return args

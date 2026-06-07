@@ -4,7 +4,7 @@
 
 - a reusable Python package for local capture and preview buffering (`lib/`)
 - an optional central DAQ gRPC receiver (`central-server/`)
-- a generic preview GUI for servers that implement `h2pcontrol.gui.v1.GuiService` (`gui/`)
+- a generic preview GUI for servers that implement `h2pcontrol.gui.v2.GuiService` (`gui/`)
 
 The current project is not one monolithic server. Instrument servers usually import the `lib/` package, expose their own control gRPC service, optionally expose `GuiService` for live preview, and can stream committed events to the central DAQ.
 
@@ -142,14 +142,14 @@ preview = preview_buffer.update(
 )
 ```
 
-Instrument servers then convert these `PreviewFrame`s into `h2pcontrol.gui.v1.Frame` messages for the GUI.
+Instrument servers then convert these `PreviewFrame`s into `h2pcontrol.gui.v2.Frame` messages for the GUI.
 
-## Instrument Preview GUI
+## GUI
 
 The GUI package in `gui/` provides `h2pgui`, a generic live preview app for servers that expose:
 
 ```proto
-h2pcontrol.gui.v1.GuiService
+h2pcontrol.gui.v2.GuiService
 ```
 
 Run from the repository:
@@ -180,15 +180,14 @@ The GUI can:
 - ask the server to save that interval with `SaveInterval`
 - save the selected GUI buffer locally with `Save local`
 - calculate a trapezoidal integral over the selected time interval
-- start/stop remote preview streaming if the server implements those controls
+- start/stop the GUI's local preview stream subscription
 
 Local GUI exports are written where `h2pgui` is running:
 
 ```text
-data/gui_exports/<target>/<source>_<timestamp>_<start>_<end>/
-├── frames.jsonl
-├── points.csv
-└── manifest.json
+data/gui_exports/<target_ip_port>/<source>_<timestamp>_<start>_<end>/
+├── frames.csv
+└── integral.csv
 ```
 
 Remote `Save selection` is different: it calls the server's `SaveInterval` RPC and the server commits selected preview frames through its own `LocalDAQ`.
@@ -207,7 +206,7 @@ The current central service:
 
 - implements `h2pcontrol.central_daq.v1.CentralDAQService/StreamDAQEvents`
 - ingests streamed DAQ events into async queues
-- writes CSV, JSONL, and HDF5 under `central-server/data/<source>/...`
+- writes CSV and HDF5 under `central-server/data/<source>/...`
 - attempts to write to InfluxDB using configuration from `.env`
 
 InfluxDB settings are read from environment variables or `.env` files:
@@ -274,6 +273,5 @@ flowchart LR
 ## Notes
 
 - The local DAQ package targets async producer methods.
-- GUI preview uses the generated `h2pcontrol.gui.v1` Python protobuf package from the Buf-generated H2PControl dependencies.
 - The central server is optional. Local files are still written even when central streaming is disabled.
-- The GUI and central server are separate Python projects with their own `pyproject.toml` and virtual environments.
+- The GUI is generic and optional. Servers can implement `GuiService` for live preview without using the local DAQ features, or use the local DAQ without implementing `GuiService` and streaming to the GUI.xs

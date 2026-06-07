@@ -164,16 +164,18 @@ def build_main_window_ui(window) -> None:
     toolbar.addWidget(QtWidgets.QLabel("Target"))
     toolbar.addWidget(window.target_edit)
     toolbar.addSeparator()
-    toolbar.addAction(
+    window.start_stream_action = toolbar.addAction(
         style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaPlay),
-        "Start",
-        window._start_remote,
+        "Start stream",
+        window._start_local_stream,
     )
-    toolbar.addAction(
+    window.start_stream_action.setToolTip("Start receiving preview frames in this GUI")
+    window.stop_stream_action = toolbar.addAction(
         style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MediaStop),
-        "Stop",
-        window._stop_remote,
+        "Stop stream",
+        window._stop_local_stream,
     )
+    window.stop_stream_action.setToolTip("Stop receiving preview frames in this GUI")
     toolbar.addAction(
         style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton),
         "Save selection",
@@ -202,8 +204,8 @@ def build_main_window_ui(window) -> None:
     toolbar.addWidget(window.window_spin)
     toolbar.addAction(
         style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_BrowserReload),
-        "Reset selection",
-        window._reset_selection_to_latest,
+        "Clear data",
+        window._clear_display_data,
     )
     toolbar.addSeparator()
     window.source_combo = QtWidgets.QComboBox()
